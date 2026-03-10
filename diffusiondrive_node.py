@@ -104,7 +104,7 @@ class DiffusionDriveROSConfig:
         self.history_length = 4
         self.command_one_hot = [0, 1, 0, 0]  # 默认直行
         self.inference_rate = 10  # Hz
-        
+
         # ========== 坐标系参数 ==========
         self.lat_ref = None
         self.lon_ref = None
@@ -408,9 +408,12 @@ class DiffusionDriveROSNode:
         self.verbose_info = bool(rospy.get_param("~verbose_info", True))
         
         self.buffer = DataBuffer(history_length=self.config.history_length)
-        
+
         # 模型组件
         self.agent = None
+
+        # 缓存 ToTensor transform，避免每帧重建
+        self._to_tensor = transforms.ToTensor()
         
         # 发布器
         self.trajectory_pub = rospy.Publisher(
@@ -476,11 +479,29 @@ class DiffusionDriveROSNode:
             self.agent = self.agent.to(self.config.device)
             self.agent.eval()
             rospy.loginfo(f"模型加载完成，设备={self.config.device}")
+            self._warmup_inference()
         except Exception as e:
             rospy.logerr(f"模型加载失败：{e}")
             import traceback
             traceback.print_exc()
             raise
+
+    def _warmup_inference(self):
+        """CUDA 推理预热，消除 JIT 编译和内存分配延迟"""
+        if self.config.device != "cuda":
+            return
+        rospy.loginfo("正在预热 CUDA 推理（3次 dummy forward）...")
+        status_dim = 4 + 2 + 2  # command_one_hot + velocity + acceleration
+        dummy = {
+            'camera_feature': torch.zeros(1, 3, 256, 1024, device=self.config.device),
+            'lidar_feature': torch.zeros(1, 1, 256, 256, device=self.config.device),
+            'status_feature': torch.zeros(1, status_dim, device=self.config.device),
+        }
+        with torch.inference_mode():
+            for _ in range(3):
+                self.agent.forward(dummy)
+        torch.cuda.synchronize()
+        rospy.loginfo("CUDA 推理预热完成")
     
     def _decode_image(self, ros_image: Image) -> np.ndarray:
         """解码 sensor_msgs/Image 为 numpy 数组"""
@@ -511,49 +532,41 @@ class DiffusionDriveROSNode:
     def _parse_pointcloud2(self, pc_msg: PointCloud2) -> np.ndarray:
         """
         解析 sensor_msgs/PointCloud2 为 numpy 数组 (N, 4) [x, y, z, intensity]
+        向量化实现：避免 Python for 循环，使用 numpy structured view
         """
         fields = {field.name: field for field in pc_msg.fields}
-        
-        required_fields = ['x', 'y', 'z']
-        for field_name in required_fields:
+
+        for field_name in ['x', 'y', 'z']:
             if field_name not in fields:
                 rospy.logwarn(f"点云缺少字段：{field_name}")
                 return np.zeros((0, 4), dtype=np.float32)
-        
+
         num_points = pc_msg.width * pc_msg.height
-        data = np.frombuffer(pc_msg.data, dtype=np.uint8)
-        
-        points = np.zeros((num_points, 4), dtype=np.float32)
-        
-        # 获取字段偏移量 (整数)
+        point_step = pc_msg.point_step
+
+        # 一次性读入所有字节，reshape 为 (N, point_step)
+        raw = np.frombuffer(pc_msg.data, dtype=np.uint8).reshape(num_points, point_step)
+
         x_offset = fields['x'].offset
         y_offset = fields['y'].offset
         z_offset = fields['z'].offset
-        
-        # 修复：获取 intensity 字段的 offset 属性，不是 PointField 对象
-        intensity_field = fields.get('intensity', fields.get('i', None))
-        if intensity_field is not None:
-            intensity_offset = intensity_field.offset  # ← 访问 .offset 属性
+        intensity_field = fields.get('intensity', fields.get('i'))
+        intensity_offset = intensity_field.offset if intensity_field is not None else -1
+
+        # 向量化提取：切片后 ascontiguousarray 再 view 为 float32
+        x = np.ascontiguousarray(raw[:, x_offset:x_offset + 4]).view(np.float32).ravel()
+        y = np.ascontiguousarray(raw[:, y_offset:y_offset + 4]).view(np.float32).ravel()
+        z = np.ascontiguousarray(raw[:, z_offset:z_offset + 4]).view(np.float32).ravel()
+        if intensity_offset >= 0:
+            intensity = np.ascontiguousarray(
+                raw[:, intensity_offset:intensity_offset + 4]
+            ).view(np.float32).ravel()
         else:
-            intensity_offset = -1
-        
-        def read_float32(data, offset):
-            return struct.unpack('f', data[offset:offset+4])[0]
-        
-        for i in range(num_points):
-            base_offset = i * pc_msg.point_step
-            points[i, 0] = read_float32(data, base_offset + x_offset)
-            points[i, 1] = read_float32(data, base_offset + y_offset)
-            points[i, 2] = read_float32(data, base_offset + z_offset)
-            if intensity_offset >= 0:  # ← 现在是整数比较
-                points[i, 3] = read_float32(data, base_offset + intensity_offset)
-            else:
-                points[i, 3] = 0.0
-        
+            intensity = np.zeros(num_points, dtype=np.float32)
+
+        points = np.stack([x, y, z, intensity], axis=1)
         valid_mask = np.isfinite(points[:, :3]).all(axis=1)
-        points = points[valid_mask]
-        
-        return points
+        return points[valid_mask]
     
     def _build_lidar_feature(self, raw_lidar) -> torch.Tensor:
         """
@@ -630,7 +643,7 @@ class DiffusionDriveROSNode:
 
         stitched_image = np.concatenate([left_cropped, right_cropped], axis=1)
         resized_image = cv2.resize(stitched_image, (self.config.camera_feature_width, self.config.camera_feature_height))
-        tensor_image = transforms.ToTensor()(resized_image)
+        tensor_image = self._to_tensor(resized_image)
         
         return tensor_image
     
@@ -676,7 +689,7 @@ class DiffusionDriveROSNode:
             'status_feature': torch.from_numpy(status_feature).float().unsqueeze(0).to(self.config.device),
         }
         t2 = time.perf_counter()
-        
+
         with torch.inference_mode():
             predictions = self.agent.forward(features)
         t3 = time.perf_counter()
