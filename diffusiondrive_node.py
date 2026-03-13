@@ -94,6 +94,7 @@ class DiffusionDriveROSConfig:
         self.pointcloud_topic = "/rslidar_points"
         self.trajectory_pub_topic = "/diffusiondrive/predicted_trajectory"
         self.path_pub_topic = "/diffusiondrive/predicted_path"
+        self.stitched_image_pub_topic = "/diffusiondrive/stitched_image"  # 拼接图像
         
         # ========== 推理配置 ==========
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -144,11 +145,23 @@ class DiffusionDriveROSConfig:
         self.lidar_split_height = 0.0
         self.hist_max_per_pixel = 100
         
-        # 图像配置 (1920x1080 → 4:1 裁剪)
+        # 图像配置 (1920x1080 → 裁剪后缩放)
         self.image_width = 1920
         self.image_height = 1080
-        self.crop_h_start = 60
-        self.crop_h_end = 1020
+
+        # 左摄像头：裁剪参数
+        self.left_crop_h_start = 0
+        self.left_crop_h_end = 1080-48-172
+        self.left_crop_w_start = 0
+        self.left_crop_w_end = 1920-200
+
+        # 右摄像头：裁剪参数
+        self.right_crop_h_start = 48
+        self.right_crop_h_end = 1080-172
+        self.right_crop_w_start = 200
+        self.right_crop_w_end = 1920
+
+        # 特征输出配置
         self.camera_feature_width = 1024
         self.camera_feature_height = 256
 
@@ -422,6 +435,9 @@ class DiffusionDriveROSNode:
         self.path_pub = rospy.Publisher(
             self.config.path_pub_topic, Path, queue_size=10
         )
+        self.stitched_image_pub = rospy.Publisher(
+            self.config.stitched_image_pub_topic, Image, queue_size=10
+        )
         
         # 订阅器
         self._setup_subscribers()
@@ -528,6 +544,18 @@ class DiffusionDriveROSNode:
             else:
                 raise ValueError(f"不支持的图像编码：{ros_image.encoding}")
         return img_np
+
+    def _numpy_to_ros_image(self, img_np: np.ndarray, encoding: str = 'rgb8', frame_id: str = 'camera') -> Image:
+        """将 numpy 数组转换为 sensor_msgs/Image"""
+        msg = Image()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = frame_id
+        msg.height, msg.width = img_np.shape[:2]
+        msg.encoding = encoding
+        msg.is_bigendian = False
+        msg.step = img_np.nbytes // img_np.shape[0]
+        msg.data = img_np.tobytes()
+        return msg
     
     def _parse_pointcloud2(self, pc_msg: PointCloud2) -> np.ndarray:
         """
@@ -619,33 +647,51 @@ class DiffusionDriveROSNode:
         
         return torch.tensor(features)
 
-    def _build_camera_feature(self, image_left_np: np.ndarray, image_right_np: np.ndarray) -> torch.Tensor:
+    def _build_camera_feature(self, image_left_np: np.ndarray, image_right_np: np.ndarray) -> Tuple[torch.Tensor, np.ndarray]:
         """
         构建相机特征 - 使用左右前视摄像头拼接
-        
+
         处理流程:
-        1. 水平拼接 (left + right)并裁剪到(3840,960)
-        2. 调整大小到 (1024, 256)
-        3. 归一化到 [0, 1]
-        4. 转换为 (3, 256, 1024)
-        
+        1. 对左右图分别应用各自的裁剪参数
+        2. 水平拼接 (left + right)
+        3. 调整大小到 (1024, 256)
+        4. 归一化到 [0, 1]
+        5. 转换为 (3, 256, 1024)
+
         Args:
             image_left_np: (1080, 1920, 3) 左前视图像
             image_right_np: (1080, 1920, 3) 右前视图像
-            
+
         Returns:
             camera_feature: (3, 256, 1024) torch.Tensor
+            stitched_image: (H, W, 3) np.ndarray 原始拼接图像
         """
-        crop_h_start = self.config.crop_h_start
-        crop_h_end = self.config.crop_h_end
-        left_cropped = image_left_np[crop_h_start:crop_h_end]
-        right_cropped = image_right_np[crop_h_start:crop_h_end]
+        # 应用左摄像头裁剪参数
+        left_cropped = image_left_np[
+            self.config.left_crop_h_start:self.config.left_crop_h_end,
+            self.config.left_crop_w_start:self.config.left_crop_w_end
+        ]
 
+        # 应用右摄像头裁剪参数
+        right_cropped = image_right_np[
+            self.config.right_crop_h_start:self.config.right_crop_h_end,
+            self.config.right_crop_w_start:self.config.right_crop_w_end
+        ]
+
+        # 如果高度不一致，调整为相同高度
+        if left_cropped.shape[0] != right_cropped.shape[0]:
+            min_h = min(left_cropped.shape[0], right_cropped.shape[0])
+            left_cropped = left_cropped[:min_h]
+            right_cropped = right_cropped[:min_h]
+
+        # 水平拼接
         stitched_image = np.concatenate([left_cropped, right_cropped], axis=1)
+
+        # 缩放到特征尺寸
         resized_image = cv2.resize(stitched_image, (self.config.camera_feature_width, self.config.camera_feature_height))
         tensor_image = self._to_tensor(resized_image)
-        
-        return tensor_image
+
+        return tensor_image, resized_image
     
     @staticmethod
     def command_to_onehot(carla_command: int, expand: bool = False) -> np.ndarray:
@@ -671,18 +717,18 @@ class DiffusionDriveROSNode:
     
     def _infer(self, command_one_hot: np.ndarray) -> np.ndarray:
         t0 = time.perf_counter()
-        
+
         image_left_np = self._decode_image(self.buffer.latest_image_left)
         image_right_np = self._decode_image(self.buffer.latest_image_right)
         raw_lidar = self._parse_pointcloud2(self.buffer.latest_pointcloud)
         t1 = time.perf_counter()
-        
-        camera_feature = self._build_camera_feature(image_left_np, image_right_np)
+
+        camera_feature, stitched_image = self._build_camera_feature(image_left_np, image_right_np)
         lidar_feature = self._build_lidar_feature(raw_lidar)
         status_feature = self.buffer.get_status_feature(
             np.array(self.config.command_one_hot, dtype=np.float32)
         )
-        
+
         features = {
             'camera_feature': camera_feature.unsqueeze(0).to(self.config.device),
             'lidar_feature': lidar_feature.unsqueeze(0).to(self.config.device),
@@ -693,19 +739,22 @@ class DiffusionDriveROSNode:
         with torch.inference_mode():
             predictions = self.agent.forward(features)
         t3 = time.perf_counter()
-        
+
         if "trajectory" in predictions:
             pred_traj = predictions["trajectory"]
         elif "pred_traj" in predictions:
             pred_traj = predictions["pred_traj"]
         else:
             raise KeyError(f"无法找到轨迹输出，可用键：{list(predictions.keys())}")
-        
+
         pred_traj_np = pred_traj.squeeze(0).cpu().numpy()
-        
+
+        # 发布拼接图像
+        self._publish_stitched_image(stitched_image)
+
         self.last_infer_ms = (t3 - t0) * 1000.0
         self.inference_count += 1
-        
+
         if self.verbose_info:
             print(f"[Timing] 信息解码：{(t1-t0)*1000:.1f}ms | "
                   f"特征构建: {(t2-t1)*1000:.1f}ms | "
@@ -723,7 +772,7 @@ class DiffusionDriveROSNode:
                 tuple(pred_traj_np.shape),
                 pred_traj_str,
             )
-        
+
         return pred_traj_np
     
     def _transform_to_world(self, traj_ego: np.ndarray) -> np.ndarray:
@@ -764,7 +813,15 @@ class DiffusionDriveROSNode:
         q.z = math.sin(yaw / 2.0)
         q.w = math.cos(yaw / 2.0)
         return q
-    
+
+    def _publish_stitched_image(self, stitched_image: np.ndarray):
+        """发布拼接后的图像"""
+        try:
+            ros_image = self._numpy_to_ros_image(stitched_image, encoding='rgb8', frame_id='camera_front')
+            self.stitched_image_pub.publish(ros_image)
+        except Exception as e:
+            rospy.logwarn(f"发布拼接图像失败：{e}")
+
     def _publish_trajectory(self, traj_world: np.ndarray):
         stamp = rospy.Time.now()
         frame_id = "enu"
