@@ -12,23 +12,9 @@ DiffusionDrive ROS1 Node - 适配 TransFuser 模型 + 多传感器输入
 无需 catkin 包，直接 python3 运行
 """
 # ==============================================================================
-# 第一部分：环境配置（必须在其他导入之前）
+# 第一部分：修复 torch.distributed
 # ==============================================================================
 import torch
-import os
-import sys
-# 禁用 torch.compile
-os.environ["TORCH_COMPILE_BACKEND"] = ""
-if hasattr(torch, '_dynamo'):
-    torch._dynamo.config.suppress_errors = True
-    torch._dynamo.config.disabled = True
-if hasattr(torch, 'compile'):
-    def _no_compile(fn, *args, **kwargs):
-        return fn
-    torch.compile = _no_compile
-print("[INFO] Disabled torch.compile for ROS compatibility")
-
-# 修复 torch.distributed
 try:
     import torch.distributed as dist
 except ImportError:
@@ -71,6 +57,7 @@ from novatel_oem7_msgs.msg import INSPVAX  # NovAtel 惯导消息
 from model.transfuser_agent import TransfuserAgent
 from model.transfuser_config import TransfuserConfig
 from model.transfuser_features import TransfuserFeatureBuilder
+from model.local_nuplan import TrajectorySampling
 
 # ==============================================================================
 # 第三部分：配置类
@@ -78,12 +65,15 @@ from model.transfuser_features import TransfuserFeatureBuilder
 class DiffusionDriveROSConfig:
     """ROS 节点配置 - 适配 TransFuser 模型"""
     def __init__(self):
+        self.verbose_info = bool(rospy.get_param("~verbose_info", True))
         # ========== 模型路径 ==========
         self.checkpoint = '/root/diffusiondrive/ckpts/diffusiondrive_navsim_88p1_PDMS.pth'
         
         # ========== 模型配置 ==========
         self.action_horizon = 8
         self.action_dim = 3  # [x, y, heading]
+        self.trajectory_sampling = TrajectorySampling(time_horizon=2, interval_length=0.5)
+        self.command_one_hot = [0, 1, 0, 0]  # 默认直行 [左，直，右，其他]
         
         # ========== ROS Topic 配置 ==========
         self.inspvax_topic = "/bynav/inspvax"
@@ -94,9 +84,9 @@ class DiffusionDriveROSConfig:
         self.pointcloud_topic = "/rslidar_points"
         self.imu_topic = "/gps/imu"  # IMU 传感器（加速度）
         self.stitched_image_pub_topic = "/diffusiondrive/stitched_image"  # 拼接图像
-        self.lidar_trajectory_pub_topic = "/diffusiondrive/trajectory"  # LiDAR frame 轨迹路径
-        self.lidar_trajectory_points_pub_topic = "/diffusiondrive/trajectory_points"  # LiDAR frame 轨迹点
-        self.local_history_path_pub_topic = "/diffusiondrive/local_history"  # 本地历史轨迹路径
+        self.trajectory_pub_topic = "/diffusiondrive/trajectory"  # LiDAR frame 轨迹路径
+        self.trajectory_points_pub_topic = "/diffusiondrive/trajectory_points"  # LiDAR frame 轨迹点
+        self.history_trajectory_pub_topic = "/diffusiondrive/history_trajectory"  # 本地历史轨迹路径
 
         # ========== 推理配置 ==========
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -104,13 +94,7 @@ class DiffusionDriveROSConfig:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_grad_enabled(False)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.history_length = 4
-        self.command_one_hot = [0, 1, 0, 0]  # 默认直行 [左，直，右，其他]
         self.inference_rate = 10  # Hz
-
-        # ========== 坐标系参数 ==========
-        self.lat_ref = None
-        self.lon_ref = None
         
         # ========== 激光雷达配置 (参考 diffusiondrive_b2d_agent.py) ==========
         # ego → NuScenes LiDAR 转换矩阵 (lidar2ego 的逆)
@@ -147,7 +131,8 @@ class DiffusionDriveROSConfig:
         self.lidar_split_height = 0.0
         self.hist_max_per_pixel = 100
         
-        # 图像配置 (1920x1080 → 裁剪后缩放)
+        # ========== 图像配置 ==========
+        #  (1920x1080 → 裁剪后缩放)
         self.image_width = 1920
         self.image_height = 1080
 
@@ -205,7 +190,7 @@ def azimuth_to_yaw(azimuth_deg: float) -> float:
     return yaw
 
 
-def enu_to_ego_local(dx: float, dy: float, yaw: float) -> Tuple[float, float]:
+def enu_to_ego(dx: float, dy: float, yaw: float) -> Tuple[float, float]:
     """ENU 位移 → 自车局部坐标系 (X-fwd, Y-left)"""
     cos_yaw = math.cos(yaw)
     sin_yaw = math.sin(yaw)
@@ -226,44 +211,42 @@ def convert_history_to_local(global_poses: List[Tuple[float, float, float]],
     Returns:
         np.ndarray: (N, 3) 局部坐标系下的轨迹 [local_x, local_y, heading_local]
     """
-    if len(global_poses) < 4:
-        poses = global_poses + [global_poses[-1]] * (4 - len(global_poses))
-    else:
-        poses = global_poses[-4:]
-
-    # 使用提供的当前位姿，如果没有提供则使用缓冲区最后一个
     if current_pose is not None:
         x0, y0, yaw0 = current_pose
     else:
-        x0, y0, yaw0 = poses[-1]
+        x0, y0, yaw0 = poglobal_posesses[-1]
 
     local_poses = []
-    for x, y, yaw in poses:
+    for x, y, yaw in global_poses:
         dx = x - x0
         dy = y - y0
-        local_x, local_y = enu_to_ego_local(dx, dy, yaw0)
+        local_x, local_y = enu_to_ego(dx, dy, yaw0)
         heading_local = (yaw - yaw0 + math.pi) % (2 * math.pi) - math.pi
         local_poses.append([local_x, local_y, heading_local])
 
     return np.array(local_poses, dtype=np.float32)
-
 
 # ==============================================================================
 # 第五部分：数据缓存类
 # ==============================================================================
 class DataBuffer:
     """ROS 数据缓存"""
-    def __init__(self, history_length: int = 4):
+    def __init__(self, trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=2, interval_length=0.5)):
         self.verbose_info = bool(rospy.get_param("~verbose_info", False))
-        self.history_length = history_length
-        self.global_pose_buffer = deque(maxlen=20) # global_pose_buffer: 以 0.1s 频率存储全局位姿，长度为 20（共 2s 历史）
+        
+        # 全局位姿缓冲更新间隔（0.1s）
+        self._pose_buffer_update_interval = 0.1
+        self._last_pose_buffer_update_time = 0.0
+        self.trajectory_sampling = trajectory_sampling
+        self.history_length = int(self.trajectory_sampling.time_horizon / self._pose_buffer_update_interval)
+        self.global_pose_buffer = deque(maxlen=self.history_length)
         self.velocity = np.array([0.0, 0.0], dtype=np.float32)
 
         self.latest_inspvax: Optional[INSPVAX] = None
         self.latest_image_left: Optional[Image] = None
         self.latest_image_right: Optional[Image] = None
         self.latest_pointcloud: Optional[PointCloud2] = None
-        self.latest_imu: Optional['Imu'] = None  # IMU 消息
+        self.latest_imu: Optional[Imu] = None
 
         self.lat_ref = None
         self.lon_ref = None
@@ -277,9 +260,6 @@ class DataBuffer:
         self._pointcloud_count = 0
         self._imu_count = 0
 
-        # 全局位姿缓冲更新间隔（0.1s）
-        self._pose_buffer_update_interval = 0.1
-        self._last_pose_buffer_update_time = 0.0
 
         # IMU 加速度滤波（移动平均窗口大小，120Hz采样 -> 10个样本约83ms）
         self._imu_accel_buffer = deque(maxlen=10)  # 保留最近 10 个 IMU 样本用于低通滤波
@@ -307,7 +287,7 @@ class DataBuffer:
             self._last_pose_buffer_update_time = current_time
 
 
-        vx, vy = enu_to_ego_local(msg.east_velocity, msg.north_velocity, yaw)
+        vx, vy = enu_to_ego(msg.east_velocity, msg.north_velocity, yaw)
         self.velocity = np.array([vx, vy], dtype=np.float32)
 
 
@@ -404,36 +384,25 @@ class DataBuffer:
             np.ndarray: (4, 3) 局部坐标系下的历史轨迹 [local_x, local_y, heading_local]
                        对应 t-1.5s, t-1.0s, t-0.5s, t (当前)
         """
-        if len(self.global_pose_buffer) < 1:
-            return np.zeros((4, 3), dtype=np.float32)
-
-        # 最后一帧作为当前帧（参考点）
-        current_frame = list(self.global_pose_buffer[-1])
+        current_pose = self.global_pose_buffer[-1]
         buffer_len = len(self.global_pose_buffer)
+        interval = int(self.trajectory_sampling.interval_length / self._pose_buffer_update_interval)
+        assert buffer_len >= interval * (self.trajectory_sampling.num_poses - 1) + 1
 
         # 以 0.5s 间隔（5 帧）向后提取 4 个历史位姿
         # 索引：[t-1.5s, t-1.0s, t-0.5s, t]
         # 对应：[n-16, n-11, n-6, n-1]
         sampling_indices = []
-        for i in range(4):
-            # 向后计数：0->15, 1->10, 2->5, 3->0
-            offset = 15 - i * 5
-            idx = buffer_len - 1 - offset
-            if idx >= 0:
-                sampling_indices.append(idx)
-            else:
-                # 缓冲区不足，使用当前位姿填充
-                sampling_indices.append(buffer_len - 1)
+        for i in range(self.trajectory_sampling.num_poses):
+            idx = (i + 1) * interval - 1
+            sampling_indices.append(idx)
 
         # 构建历史位姿列表
         global_poses = []
         for idx in sampling_indices:
             global_poses.append(list(self.global_pose_buffer[idx]))
 
-        # 使用最后一帧（当前帧）作为参考点进行坐标转换
-        local_poses = convert_history_to_local(global_poses, current_pose=tuple(current_frame))
-
-        return local_poses
+        return convert_history_to_local(global_poses, current_pose)
     
     def get_status_feature(self, command_one_hot: np.ndarray) -> np.ndarray:
         return np.concatenate([command_one_hot, self.velocity, self.acceleration], dtype=np.float32)
@@ -470,12 +439,23 @@ class MemoryMonitor:
         }
     
     def print_status(self, label=""):
+        """打印当前显存状态"""
         cuda_mem = self.get_cuda_memory()
         sys_mem = self.get_system_memory()
         prefix = f"[{label}] " if label else ""
         print(f"{prefix}显存状态:")
-        print(f"  CUDA: 已分配={cuda_mem['allocated']:.0f}MB, 预留={cuda_mem['reserved']:.0f}MB, 空闲={cuda_mem['free']:.0f}MB")
-        print(f"  系统：已用={sys_mem['used']:.0f}MB, 可用={sys_mem['available']:.0f}MB ({sys_mem['percent']}%)")
+        print(f"  CUDA: 已分配={cuda_mem['allocated']:.0f}MB, "
+              f"预留={cuda_mem['reserved']:.0f}MB, "
+              f"空闲={cuda_mem['free']:.0f}MB/{cuda_mem['total']:.0f}MB")
+        print(f"  系统：已用={sys_mem['used']:.0f}MB, "
+              f"可用={sys_mem['available']:.0f}MB ({sys_mem['percent']}%)")
+        
+        self.history.append({
+            'label': label,
+            'cuda': cuda_mem,
+            'sys': sys_mem,
+            'time': rospy.Time.now()
+        })
     
     def check_threshold(self, threshold_percent=85):
         cuda_mem = self.get_cuda_memory()
@@ -497,10 +477,9 @@ class DiffusionDriveROSNode:
         rospy.init_node('diffusiondrive_node', anonymous=False)
         self.config = DiffusionDriveROSConfig()
         self.model_config = TransfuserConfig()
-        self.verbose_info = bool(rospy.get_param("~verbose_info", False))
         
-        self.buffer = DataBuffer(history_length=self.config.history_length)
-        self.buffer.verbose_info = self.verbose_info
+        self.buffer = DataBuffer(self.config.trajectory_sampling)
+        self.buffer.verbose_info = self.config.verbose_info
 
         # 模型组件
         self.agent = None
@@ -512,14 +491,14 @@ class DiffusionDriveROSNode:
         self.stitched_image_pub = rospy.Publisher(
             self.config.stitched_image_pub_topic, Image, queue_size=10
         )
-        self.lidar_trajectory_pub = rospy.Publisher(
-            self.config.lidar_trajectory_pub_topic, Path, queue_size=10
+        self.trajectory_pub = rospy.Publisher(
+            self.config.trajectory_pub_topic, Path, queue_size=10
         )
-        self.lidar_trajectory_points_pub = rospy.Publisher(
-            self.config.lidar_trajectory_points_pub_topic, PoseArray, queue_size=10
+        self.trajectory_points_pub = rospy.Publisher(
+            self.config.trajectory_points_pub_topic, PoseArray, queue_size=10
         )
-        self.local_history_path_pub = rospy.Publisher(
-            self.config.local_history_path_pub_topic, Path, queue_size=10
+        self.history_trajectory_pub = rospy.Publisher(
+            self.config.history_trajectory_pub_topic, Path, queue_size=10
         )
 
         # 订阅器
@@ -538,12 +517,13 @@ class DiffusionDriveROSNode:
         self.last_infer_ms: Optional[float] = None
         self.inference_count = 0
 
-        if self.verbose_info:
+        if self.config.verbose_info:
             # ========== 打印配置 ==========
             print("=" * 60)
             print("DiffusionDrive ROS 配置")
             print("=" * 60)
             print(f"设备：{self.config.device}")
+            print(f"推理频率：{self.inference_rate} Hz")
             print(f"BEV 范围：[{self.config.lidar_min_x}, {self.config.lidar_max_x}] x [{self.config.lidar_min_y}, {self.config.lidar_max_y}]")
             print(f"BEV 分辨率：{int((self.config.lidar_max_x - self.config.lidar_min_x) * self.config.pixels_per_meter)}x"
                 f"{int((self.config.lidar_max_y - self.config.lidar_min_y) * self.config.pixels_per_meter)}")
@@ -558,7 +538,7 @@ class DiffusionDriveROSNode:
         rospy.Subscriber(self.config.camera_left_info_topic, CameraInfo, self._camera_left_info_callback, queue_size=1)
         rospy.Subscriber(self.config.camera_right_info_topic, CameraInfo, self._camera_right_info_callback, queue_size=1)
         rospy.Subscriber(self.config.pointcloud_topic, PointCloud2, self._pointcloud_callback, queue_size=1)
-        rospy.Subscriber(self.config.imu_topic, Imu, self._imu_callback, queue_size=10)  # IMU 高频，队列较大
+        rospy.Subscriber(self.config.imu_topic, Imu, self._imu_callback, queue_size=10)
         rospy.loginfo(f"已订阅：{self.config.inspvax_topic}, {self.config.image_left_topic}, {self.config.image_right_topic}, {self.config.pointcloud_topic}, {self.config.imu_topic}")
     
     def _inspvax_callback(self, msg: INSPVAX):
@@ -580,7 +560,6 @@ class DiffusionDriveROSNode:
         self.buffer.add_pointcloud(msg)
 
     def _imu_callback(self, msg: Imu):
-        """IMU 数据回调"""
         self.buffer.add_imu(msg)
 
     def _load_models(self):
@@ -803,51 +782,6 @@ class DiffusionDriveROSNode:
             else:
                 cmd[1] = 1.0
             return cmd
-    
-    def _infer(self, command_one_hot: np.ndarray) -> np.ndarray:
-        t0 = time.perf_counter()
-
-        image_left_np = self._decode_image(self.buffer.latest_image_left)
-        image_right_np = self._decode_image(self.buffer.latest_image_right)
-        raw_lidar = self._parse_pointcloud2(self.buffer.latest_pointcloud)
-        t1 = time.perf_counter()
-
-        camera_feature, stitched_image = self._build_camera_feature(image_left_np, image_right_np)
-        lidar_feature = self._build_lidar_feature(raw_lidar)
-        status_feature = self.buffer.get_status_feature(command_one_hot)
-
-        features = {
-            'camera_feature': camera_feature.unsqueeze(0).to(self.config.device),
-            'lidar_feature': lidar_feature.unsqueeze(0).to(self.config.device),
-            'status_feature': torch.from_numpy(status_feature).float().unsqueeze(0).to(self.config.device),
-        }
-        t2 = time.perf_counter()
-
-        with torch.inference_mode():
-            predictions = self.agent.forward(features)
-        t3 = time.perf_counter()
-
-        if "trajectory" in predictions:
-            pred_traj = predictions["trajectory"]
-        elif "pred_traj" in predictions:
-            pred_traj = predictions["pred_traj"]
-        else:
-            raise KeyError(f"无法找到轨迹输出，可用键：{list(predictions.keys())}")
-
-        pred_traj_np = pred_traj.squeeze(0).cpu().numpy()
-
-        # 发布拼接图像
-        self._publish_stitched_image(stitched_image)
-
-        self.last_infer_ms = (t3 - t0) * 1000.0
-        self.inference_count += 1
-
-        if self.verbose_info:
-            print(f"[Timing] 信息解码：{(t1-t0)*1000:.1f}ms | "
-                  f"特征构建: {(t2-t1)*1000:.1f}ms | "
-                  f"模型推理：{(t3-t2)*1000:.1f}ms | "
-                  f"总计：{(t3-t0)*1000:.1f}ms")
-        return pred_traj_np
 
     def _transform_to_lidar_frame(self, traj_ego: np.ndarray) -> np.ndarray:
         """
@@ -896,24 +830,30 @@ class DiffusionDriveROSNode:
         except Exception as e:
             rospy.logwarn(f"发布拼接图像失败：{e}")
 
-    def _publish_local_history_path(self, local_history: np.ndarray):
+    def _publish_history_path(self, local_history: np.ndarray):
         """
         发布本地历史轨迹为 Path 消息（在 rslidar frame 中）
 
         Args:
             local_history: (N, 3) numpy array, 每行为 [x, y, yaw] 在 ego frame 中
         """
+        if self.config.verbose_info:
+            rospy.loginfo_throttle(
+                1.0,
+                "LocalHistory:\n%s",
+                np.array2string(local_history, precision=3, suppress_small=True)
+            )
         stamp = rospy.Time.now()
         frame_id = "rslidar"
 
         # 将本地历史轨迹从 ego frame 转换到 lidar frame
-        local_history_lidar = self._transform_to_lidar_frame(local_history)
+        local_history = self._transform_to_lidar_frame(local_history)
 
         path = Path()
         path.header.stamp = stamp
         path.header.frame_id = frame_id
 
-        for pt in local_history_lidar:
+        for pt in local_history:
             pose_stamped = PoseStamped()
             pose_stamped.header = path.header
             pose_stamped.pose.position.x = float(pt[0])
@@ -923,16 +863,10 @@ class DiffusionDriveROSNode:
             pose_stamped.pose.orientation = self._yaw_to_quaternion(heading)
             path.poses.append(pose_stamped)
 
-        self.local_history_path_pub.publish(path)
+        self.history_trajectory_pub.publish(path)
 
-        if self.verbose_info:
-            rospy.loginfo_throttle(
-                1.0,
-                "LocalHistory:\n%s",
-                np.array2string(local_history, precision=3, suppress_small=True)
-            )
 
-    def _publish_lidar_trajectory(self, traj_ego: np.ndarray):
+    def _publish_trajectory(self, traj_ego: np.ndarray):
         """
         发布 LiDAR frame 中的轨迹，包括路径和轨迹点
 
@@ -940,11 +874,17 @@ class DiffusionDriveROSNode:
         1. Path - 用于可视化连接的路径线
         2. PoseArray - 用于可视化离散的轨迹点
         """
+        if self.config.verbose_info:
+            rospy.loginfo_throttle(
+                1.0,
+                "Predict History:\n%s\n",
+                np.array2string(traj_ego, precision=3, suppress_small=True)
+            )
         stamp = rospy.Time.now()
         frame_id = "rslidar"
 
         # 转换到 lidar frame
-        traj_lidar = self._transform_to_lidar_frame(traj_ego)
+        traj_ego = self._transform_to_lidar_frame(traj_ego)
 
         # 构建 Path 消息（连接的路径线）
         path = Path()
@@ -956,7 +896,7 @@ class DiffusionDriveROSNode:
         pose_array.header.stamp = stamp
         pose_array.header.frame_id = frame_id
 
-        for pt in traj_lidar:
+        for pt in traj_ego:
             # 创建 PoseStamped 用于 Path
             pose_stamped = PoseStamped()
             pose_stamped.header = path.header
@@ -972,15 +912,54 @@ class DiffusionDriveROSNode:
             pose_array.poses.append(pose)
 
         # 同时发布 Path 和 PoseArray
-        self.lidar_trajectory_pub.publish(path)
-        self.lidar_trajectory_points_pub.publish(pose_array)
+        self.trajectory_pub.publish(path)
+        self.trajectory_points_pub.publish(pose_array)
         
-        if self.verbose_info:
-            rospy.loginfo_throttle(
-                1.0,
-                "Predict History:\n%s\n",
-                np.array2string(traj_ego, precision=3, suppress_small=True)
-            )
+
+    def _infer(self, command_one_hot: np.ndarray) -> np.ndarray:
+        t0 = time.perf_counter()
+
+        image_left_np = self._decode_image(self.buffer.latest_image_left)
+        image_right_np = self._decode_image(self.buffer.latest_image_right)
+        raw_lidar = self._parse_pointcloud2(self.buffer.latest_pointcloud)
+        t1 = time.perf_counter()
+
+        camera_feature, stitched_image = self._build_camera_feature(image_left_np, image_right_np)
+        lidar_feature = self._build_lidar_feature(raw_lidar)
+        status_feature = self.buffer.get_status_feature(command_one_hot)
+
+        features = {
+            'camera_feature': camera_feature.unsqueeze(0).to(self.config.device),
+            'lidar_feature': lidar_feature.unsqueeze(0).to(self.config.device),
+            'status_feature': torch.from_numpy(status_feature).float().unsqueeze(0).to(self.config.device),
+        }
+        t2 = time.perf_counter()
+
+        with torch.inference_mode():
+            predictions = self.agent.forward(features)
+        t3 = time.perf_counter()
+
+        if "trajectory" in predictions:
+            pred_traj = predictions["trajectory"]
+        elif "pred_traj" in predictions:
+            pred_traj = predictions["pred_traj"]
+        else:
+            raise KeyError(f"无法找到轨迹输出，可用键：{list(predictions.keys())}")
+
+        pred_traj_np = pred_traj.squeeze(0).cpu().numpy()
+
+        # 发布拼接图像
+        self._publish_stitched_image(stitched_image)
+
+        self.last_infer_ms = (t3 - t0) * 1000.0
+        self.inference_count += 1
+
+        if self.config.verbose_info:
+            print(f"[Timing] 信息解码：{(t1-t0)*1000:.1f}ms | "
+                  f"特征构建: {(t2-t1)*1000:.1f}ms | "
+                  f"模型推理：{(t3-t2)*1000:.1f}ms | "
+                  f"总计：{(t3-t0)*1000:.1f}ms")
+        return pred_traj_np
 
     def run(self):
         rospy.loginfo("开始 DiffusionDrive 推理循环...")
@@ -990,9 +969,9 @@ class DiffusionDriveROSNode:
                     command_one_hot = self.command_to_onehot(carla_command=3, expand=False)
                     traj_ego = self._infer(command_one_hot)
                     local_history = self.buffer.get_local_history_trajectory()
-                    self._publish_local_history_path(local_history)
-                    self._publish_lidar_trajectory(traj_ego)
-                    self.memory_monitor.check_threshold(threshold_percent=85)
+                    self._publish_history_path(local_history)
+                    self._publish_trajectory(traj_ego)
+                    # self.memory_monitor.check_threshold(threshold_percent=85)
                 else:
                     rospy.loginfo_throttle(
                         5,
