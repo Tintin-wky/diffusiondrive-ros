@@ -49,7 +49,7 @@ import struct
 
 # ROS 消息类型
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo, PointField, Imu
+from sensor_msgs.msg import Image, PointCloud2, CameraInfo, PointField, Imu, CompressedImage
 from geometry_msgs.msg import PoseStamped, PoseArray, Quaternion, Twist
 from novatel_oem7_msgs.msg import INSPVAX  # NovAtel 惯导消息
 
@@ -73,12 +73,12 @@ class DiffusionDriveROSConfig:
         self.action_horizon = 8
         self.action_dim = 3  # [x, y, heading]
         self.trajectory_sampling = TrajectorySampling(time_horizon=2, interval_length=0.5)
-        self.command_one_hot = [0, 1, 0, 0]  # 默认直行 [左，直，右，其他]
+        self.command_one_hot = [0, 0, 1, 0]  # 默认直行 [左，直，右，其他]
         
         # ========== ROS Topic 配置 ==========
         self.inspvax_topic = "/bynav/inspvax"
-        self.image_left_topic = "/camera/left_front_view"      # 左前视
-        self.image_right_topic = "/camera/right_front_view"    # 右前视
+        self.image_left_topic = "/camera/left_front_view/compressed"      # 左前视（压缩）
+        self.image_right_topic = "/camera/right_front_view/compressed"    # 右前视（压缩）
         self.camera_left_info_topic = "/camera/left_front_view/camera_info"
         self.camera_right_info_topic = "/camera/right_front_view/camera_info"
         self.pointcloud_topic = "/rslidar_points"
@@ -136,17 +136,23 @@ class DiffusionDriveROSConfig:
         self.image_width = 1920
         self.image_height = 1080
 
+        self.clip_w = 224
+        self.clip_h = 60
+        self.final_w = self.image_width - self.clip_w
+        self.final_h = self.final_w//2
+        assert self.final_h < self.image_height
+
         # 左摄像头：裁剪参数
         self.left_crop_h_start = 0
-        self.left_crop_h_end = 1080-48-172
-        self.left_crop_w_start = 0
-        self.left_crop_w_end = 1920-200
+        self.left_crop_h_end = self.final_h
+        self.left_crop_w_end = self.image_width - self.clip_w
+        self.left_crop_w_start = self.left_crop_w_end - self.final_w
 
         # 右摄像头：裁剪参数
-        self.right_crop_h_start = 48
-        self.right_crop_h_end = 1080-172
-        self.right_crop_w_start = 200
-        self.right_crop_w_end = 1920
+        self.right_crop_h_start = self.clip_h
+        self.right_crop_h_end = self.final_h + self.clip_h
+        self.right_crop_w_start =  self.clip_w
+        self.right_crop_w_end = self.final_w + self.right_crop_w_start
 
         # 特征输出配置
         self.camera_feature_width = 1024
@@ -300,11 +306,11 @@ class DataBuffer:
                 self._inspvax_count, x_enu, y_enu, yaw, vx, vy, ax, ay
             )
     
-    def add_image_left(self, image: Image):
+    def add_image_left(self, image: CompressedImage):
         self.latest_image_left = image
         self._image_left_count += 1
 
-    def add_image_right(self, image: Image):
+    def add_image_right(self, image: CompressedImage):
         self.latest_image_right = image
         self._image_right_count += 1
     
@@ -533,8 +539,8 @@ class DiffusionDriveROSNode:
     
     def _setup_subscribers(self):
         rospy.Subscriber(self.config.inspvax_topic, INSPVAX, self._inspvax_callback, queue_size=1)
-        rospy.Subscriber(self.config.image_left_topic, Image, self._image_left_callback, queue_size=1)
-        rospy.Subscriber(self.config.image_right_topic, Image, self._image_right_callback, queue_size=1)
+        rospy.Subscriber(self.config.image_left_topic, CompressedImage, self._image_left_callback, queue_size=1)
+        rospy.Subscriber(self.config.image_right_topic, CompressedImage, self._image_right_callback, queue_size=1)
         rospy.Subscriber(self.config.camera_left_info_topic, CameraInfo, self._camera_left_info_callback, queue_size=1)
         rospy.Subscriber(self.config.camera_right_info_topic, CameraInfo, self._camera_right_info_callback, queue_size=1)
         rospy.Subscriber(self.config.pointcloud_topic, PointCloud2, self._pointcloud_callback, queue_size=1)
@@ -597,30 +603,13 @@ class DiffusionDriveROSNode:
         torch.cuda.synchronize()
         rospy.loginfo("CUDA 推理预热完成")
     
-    def _decode_image(self, ros_image: Image) -> np.ndarray:
-        """解码 sensor_msgs/Image 为 numpy 数组"""
-        if ros_image.encoding == 'rgb8':
-            img_np = np.frombuffer(ros_image.data, dtype=np.uint8).reshape(
-                ros_image.height, ros_image.width, 3
-            )
-        elif ros_image.encoding == 'bgr8':
-            img_np = np.frombuffer(ros_image.data, dtype=np.uint8).reshape(
-                ros_image.height, ros_image.width, 3
-            )
-            img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-        elif ros_image.encoding == 'mono8':
-            img_np = np.frombuffer(ros_image.data, dtype=np.uint8).reshape(
-                ros_image.height, ros_image.width
-            )
-            img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
-        else:
-            img_np = np.frombuffer(ros_image.data, dtype=np.uint8)
-            if img_np.size == ros_image.height * ros_image.width * 3:
-                img_np = img_np.reshape(ros_image.height, ros_image.width, 3)
-                if ros_image.encoding.startswith('bgr'):
-                    img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-            else:
-                raise ValueError(f"不支持的图像编码：{ros_image.encoding}")
+    def _decode_image(self, ros_image: CompressedImage) -> np.ndarray:
+        """解码 sensor_msgs/CompressedImage 压缩格式为 numpy 数组"""
+        nparr = np.frombuffer(ros_image.data, dtype=np.uint8)
+        img_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)  # 读取为 BGR
+        if img_np is None:
+            raise ValueError("无法解码压缩图像数据")
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)  # 转换为 RGB
         return img_np
 
     def _numpy_to_ros_image(self, img_np: np.ndarray, encoding: str = 'rgb8', frame_id: str = 'camera') -> Image:
