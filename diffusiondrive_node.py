@@ -50,8 +50,10 @@ import struct
 # ROS 消息类型
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo, PointField, Imu, CompressedImage
-from geometry_msgs.msg import PoseStamped, PoseArray, Quaternion, Twist
+from geometry_msgs.msg import PoseStamped, PoseArray, Quaternion, Twist, Point
 from novatel_oem7_msgs.msg import INSPVAX  # NovAtel 惯导消息
+from visualization_msgs.msg import Marker
+from std_msgs.msg import Int32
 
 # TransFuser/DiffusionDrive 导入
 from model.transfuser_agent import TransfuserAgent
@@ -73,7 +75,7 @@ class DiffusionDriveROSConfig:
         self.action_horizon = 8
         self.action_dim = 3  # [x, y, heading]
         self.trajectory_sampling = TrajectorySampling(time_horizon=2, interval_length=0.5)
-        self.command_one_hot = [0, 0, 1, 0]  # 默认直行 [左，直，右，其他]
+        self.command_one_hot = [0, 1, 0, 0]  # 默认直行 [左，直，右，其他]
         
         # ========== ROS Topic 配置 ==========
         self.inspvax_topic = "/bynav/inspvax"
@@ -83,10 +85,19 @@ class DiffusionDriveROSConfig:
         self.camera_right_info_topic = "/camera/right_front_view/camera_info"
         self.pointcloud_topic = "/rslidar_points"
         self.imu_topic = "/gps/imu"  # IMU 传感器（加速度）
-        self.stitched_image_pub_topic = "/diffusiondrive/stitched_image"  # 拼接图像
-        self.trajectory_pub_topic = "/diffusiondrive/trajectory"  # LiDAR frame 轨迹路径
-        self.trajectory_points_pub_topic = "/diffusiondrive/trajectory_points"  # LiDAR frame 轨迹点
-        self.history_trajectory_pub_topic = "/diffusiondrive/history_trajectory"  # 本地历史轨迹路径
+        self.input_image_pub_topic = "/diffusiondrive/input_image"  # 输入图像（拼接/裁剪）
+        self.fpv_trajectory_view_topic = "/diffusiondrive/fpv_trajectory_view"  # 第一视角轨迹可视化
+
+        # ========== 图像输入模式 ==========
+        # "dual_camera": 左右摄像头拼接 (默认)
+        # "single_camera": 使用ZED
+        self.image_input_mode = rospy.get_param("~image_input_mode", "single_camera")
+        assert self.image_input_mode in ("dual_camera", "single_camera"), \
+            f"image_input_mode 必须是 'dual_camera' 或 'single_camera', 得到: {self.image_input_mode}"
+        self.image_single_camera_topic = "/camera/left/image_raw/compressed"
+        self.history_marker_topic = "/diffusiondrive/history_marker"
+        self.prediction_marker_topic = "/diffusiondrive/prediction_marker"
+        self.command_topic = "/diffusiondrive/command"  # 导航命令输入
 
         # ========== 推理配置 ==========
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -153,6 +164,37 @@ class DiffusionDriveROSConfig:
         self.right_crop_h_end = self.final_h + self.clip_h
         self.right_crop_w_start =  self.clip_w
         self.right_crop_w_end = self.final_w + self.right_crop_w_start
+
+        # 单摄像头（ZED）：独立裁剪参数
+        # 原始 1920x1080 → 裁剪后 1920x480
+        self.single_crop_h_start = 280
+        self.single_crop_h_end = self.image_width // 4 + self.single_crop_h_start
+        self.single_crop_w_start = 0
+        self.single_crop_w_end = self.image_width  # 保持全宽 1920
+
+        # ========== 单相机投影参数（第一视角可视化） ==========
+        # 相机内参
+        self.single_camera_intrinsic = np.array([
+            [1065.52408, 0.0, 982.56435],
+            [0.0, 1067.06851, 540.12547],
+            [0.0, 0.0, 1.0]
+        ])
+        self.single_camera_distortion = np.array([-0.041263, 0.017263, 0.002901, 0.001913])
+
+        # rslidar → camera 外参（安装偏差）
+        # 这些是相机相对于 lidar 的安装偏差（小角度）
+        self.camera_to_rslidar_euler_deg = [-1.6125, -0.0436, -1.5416]  # degrees (安装偏差)
+        self.camera_to_rslidar_translation = np.array([0.0105, -0.0451, -0.2600])  # meters (相机在lidar坐标系中的位置)
+
+        # 坐标系轴转换：LiDAR (X前,Y左,Z上) → Camera (Z前,X右,Y下)
+        # LiDAR X → Camera Z
+        # LiDAR Y → Camera -X (左→右，取负)
+        # LiDAR Z → Camera -Y (上→下，取负)
+        self.lidar_to_camera_axis_transform = np.array([
+            [ 0.0, -1.0,  0.0],  # Camera X = -LiDAR Y
+            [ 0.0,  0.0, -1.0],  # Camera Y = -LiDAR Z
+            [ 1.0,  0.0,  0.0],  # Camera Z = LiDAR X
+        ])
 
         # 特征输出配置
         self.camera_feature_width = 1024
@@ -237,8 +279,10 @@ def convert_history_to_local(global_poses: List[Tuple[float, float, float]],
 # ==============================================================================
 class DataBuffer:
     """ROS 数据缓存"""
-    def __init__(self, trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=2, interval_length=0.5)):
+    def __init__(self, trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=2, interval_length=0.5),
+                 image_input_mode: str = "dual_camera"):
         self.verbose_info = bool(rospy.get_param("~verbose_info", False))
+        self.image_input_mode = image_input_mode
         
         # 全局位姿缓冲更新间隔（0.1s）
         self._pose_buffer_update_interval = 0.1
@@ -251,6 +295,7 @@ class DataBuffer:
         self.latest_inspvax: Optional[INSPVAX] = None
         self.latest_image_left: Optional[Image] = None
         self.latest_image_right: Optional[Image] = None
+        self.latest_image_single: Optional[CompressedImage] = None
         self.latest_pointcloud: Optional[PointCloud2] = None
         self.latest_imu: Optional[Imu] = None
 
@@ -262,6 +307,7 @@ class DataBuffer:
 
         self._image_left_count = 0
         self._image_right_count = 0
+        self._image_single_count = 0
         self._inspvax_count = 0
         self._pointcloud_count = 0
         self._imu_count = 0
@@ -313,7 +359,11 @@ class DataBuffer:
     def add_image_right(self, image: CompressedImage):
         self.latest_image_right = image
         self._image_right_count += 1
-    
+
+    def add_image_single(self, image: CompressedImage):
+        self.latest_image_single = image
+        self._image_single_count += 1
+
     def add_camera_left_info(self, info: CameraInfo):
         if self.camera_left_info is None:
             self.camera_left_info = info
@@ -355,22 +405,34 @@ class DataBuffer:
                                (1.0 - self._imu_filter_alpha) * self.acceleration)
 
     def is_ready(self) -> bool:
+        # 单相机图像始终必需（用于第一视角可视化）
+        images_ready = self.latest_image_single is not None
+        # dual_camera 模式额外需要左右相机
+        if self.image_input_mode == "dual_camera":
+            images_ready = images_ready and (
+                self.latest_image_left is not None and
+                self.latest_image_right is not None
+            )
         return (
             len(self.global_pose_buffer) >= self.history_length and
-            self.latest_image_left is not None and
-            self.latest_image_right is not None and
+            images_ready and
             self.latest_inspvax is not None and
             self.latest_pointcloud is not None
         )
-    
+
     def not_ready_reasons(self) -> List[str]:
         reasons = []
         if len(self.global_pose_buffer) < self.history_length:
             reasons.append(f"history={len(self.global_pose_buffer)}/{self.history_length}")
-        if self.latest_image_left is None:
-            reasons.append("image_left=none")
-        if self.latest_image_right is None:
-            reasons.append("image_right=none")
+        # 单相机图像始终必需
+        if self.latest_image_single is None:
+            reasons.append("image_single=none")
+        # dual_camera 模式额外需要左右相机
+        if self.image_input_mode == "dual_camera":
+            if self.latest_image_left is None:
+                reasons.append("image_left=none")
+            if self.latest_image_right is None:
+                reasons.append("image_right=none")
         if self.latest_inspvax is None:
             reasons.append("inspvax=none")
         if self.latest_pointcloud is None:
@@ -484,27 +546,34 @@ class DiffusionDriveROSNode:
         self.config = DiffusionDriveROSConfig()
         self.model_config = TransfuserConfig()
         
-        self.buffer = DataBuffer(self.config.trajectory_sampling)
+        self.buffer = DataBuffer(self.config.trajectory_sampling, self.config.image_input_mode)
         self.buffer.verbose_info = self.config.verbose_info
 
         # 模型组件
         self.agent = None
 
+        # 导航命令 (默认直行)
+        # 1=左转, 2=右转, 3=直行, 其他=直行
+        self.current_command = 3
+
         # 缓存 ToTensor transform，避免每帧重建
         self._to_tensor = transforms.ToTensor()
         
         # 发布器
-        self.stitched_image_pub = rospy.Publisher(
-            self.config.stitched_image_pub_topic, Image, queue_size=10
+        self.input_image_pub = rospy.Publisher(
+            self.config.input_image_pub_topic, Image, queue_size=10
         )
-        self.trajectory_pub = rospy.Publisher(
-            self.config.trajectory_pub_topic, Path, queue_size=10
+        # Marker 发布器 (替代 Path/PoseArray)
+        self.history_marker_pub = rospy.Publisher(
+            self.config.history_marker_topic, Marker, queue_size=10
         )
-        self.trajectory_points_pub = rospy.Publisher(
-            self.config.trajectory_points_pub_topic, PoseArray, queue_size=10
+        self.prediction_marker_pub = rospy.Publisher(
+            self.config.prediction_marker_topic, Marker, queue_size=10
         )
-        self.history_trajectory_pub = rospy.Publisher(
-            self.config.history_trajectory_pub_topic, Path, queue_size=10
+
+        # 第一视角轨迹可视化发布器
+        self.fpv_trajectory_pub = rospy.Publisher(
+            self.config.fpv_trajectory_view_topic, Image, queue_size=10
         )
 
         # 订阅器
@@ -539,14 +608,38 @@ class DiffusionDriveROSNode:
     
     def _setup_subscribers(self):
         rospy.Subscriber(self.config.inspvax_topic, INSPVAX, self._inspvax_callback, queue_size=1)
-        rospy.Subscriber(self.config.image_left_topic, CompressedImage, self._image_left_callback, queue_size=1)
-        rospy.Subscriber(self.config.image_right_topic, CompressedImage, self._image_right_callback, queue_size=1)
-        rospy.Subscriber(self.config.camera_left_info_topic, CameraInfo, self._camera_left_info_callback, queue_size=1)
-        rospy.Subscriber(self.config.camera_right_info_topic, CameraInfo, self._camera_right_info_callback, queue_size=1)
         rospy.Subscriber(self.config.pointcloud_topic, PointCloud2, self._pointcloud_callback, queue_size=1)
         rospy.Subscriber(self.config.imu_topic, Imu, self._imu_callback, queue_size=10)
-        rospy.loginfo(f"已订阅：{self.config.inspvax_topic}, {self.config.image_left_topic}, {self.config.image_right_topic}, {self.config.pointcloud_topic}, {self.config.imu_topic}")
-    
+
+        # 单相机始终订阅（用于第一视角轨迹可视化）
+        rospy.Subscriber(self.config.image_single_camera_topic, CompressedImage, self._image_single_callback, queue_size=1)
+        rospy.loginfo(f"单相机订阅: {self.config.image_single_camera_topic} (用于第一视角可视化)")
+
+        # dual_camera 模式额外订阅左右相机
+        if self.config.image_input_mode == "dual_camera":
+            rospy.Subscriber(self.config.image_left_topic, CompressedImage, self._image_left_callback, queue_size=1)
+            rospy.Subscriber(self.config.image_right_topic, CompressedImage, self._image_right_callback, queue_size=1)
+            rospy.Subscriber(self.config.camera_left_info_topic, CameraInfo, self._camera_left_info_callback, queue_size=1)
+            rospy.Subscriber(self.config.camera_right_info_topic, CameraInfo, self._camera_right_info_callback, queue_size=1)
+            rospy.loginfo(f"双相机模式额外订阅: {self.config.image_left_topic}, {self.config.image_right_topic}")
+
+        rospy.loginfo(f"已订阅: {self.config.inspvax_topic}, {self.config.pointcloud_topic}, {self.config.imu_topic}")
+
+        # 导航命令订阅
+        rospy.Subscriber(self.config.command_topic, Int32, self._command_callback, queue_size=1)
+        rospy.loginfo(f"导航命令订阅: {self.config.command_topic} (1=左转, 2=右转, 3=直行)")
+
+    def _command_callback(self, msg: Int32):
+        """接收导航命令"""
+        cmd = msg.data
+        if cmd in (1, 2, 3):
+            self.current_command = cmd
+            cmd_name = {1: "左转", 2: "右转", 3: "直行"}
+            rospy.loginfo(f"导航命令更新: {cmd} ({cmd_name.get(cmd, '未知')})")
+        else:
+            rospy.logwarn(f"无效命令: {cmd}, 使用默认直行(3)")
+            self.current_command = 3
+
     def _inspvax_callback(self, msg: INSPVAX):
         self.buffer.add_inspvax(msg)
     
@@ -555,7 +648,10 @@ class DiffusionDriveROSNode:
     
     def _image_right_callback(self, msg: Image):
         self.buffer.add_image_right(msg)
-    
+
+    def _image_single_callback(self, msg: CompressedImage):
+        self.buffer.add_image_single(msg)
+
     def _camera_left_info_callback(self, msg: CameraInfo):
         self.buffer.add_camera_left_info(msg)
 
@@ -721,7 +817,7 @@ class DiffusionDriveROSNode:
 
         Returns:
             camera_feature: (3, 256, 1024) torch.Tensor
-            stitched_image: (H, W, 3) np.ndarray 原始拼接图像
+            input_image: (H, W, 3) np.ndarray 拼接后的输入图像
         """
         # 应用左摄像头裁剪参数
         left_cropped = image_left_np[
@@ -742,14 +838,31 @@ class DiffusionDriveROSNode:
             right_cropped = right_cropped[:min_h]
 
         # 水平拼接
-        stitched_image = np.concatenate([left_cropped, right_cropped], axis=1)
+        input_image = np.concatenate([left_cropped, right_cropped], axis=1)
 
         # 缩放到特征尺寸
-        resized_image = cv2.resize(stitched_image, (self.config.camera_feature_width, self.config.camera_feature_height))
+        resized_image = cv2.resize(input_image, (self.config.camera_feature_width, self.config.camera_feature_height))
         tensor_image = self._to_tensor(resized_image)
 
         return tensor_image, resized_image
-    
+
+    def _build_camera_feature_single(self, image_np: np.ndarray) -> Tuple[torch.Tensor, np.ndarray]:
+        """
+        single_camera 模式: 裁剪单张图像并构建相机特征
+        Args:
+            image_np: (H, W, 3) 单张图像，预期 1920x1080
+
+        Returns:
+            camera_feature: (3, 256, 1024) torch.Tensor
+            cropped_image: (H', W', 3) np.ndarray 裁剪后的图像 (1920x480)
+        """
+        cropped = image_np[
+            self.config.single_crop_h_start:self.config.single_crop_h_end,
+            self.config.single_crop_w_start:self.config.single_crop_w_end
+        ]
+        resized = cv2.resize(cropped, (self.config.camera_feature_width, self.config.camera_feature_height))
+        return self._to_tensor(resized), resized
+
     @staticmethod
     def command_to_onehot(carla_command: int, expand: bool = False) -> np.ndarray:
         if expand:
@@ -772,36 +885,257 @@ class DiffusionDriveROSNode:
                 cmd[1] = 1.0
             return cmd
 
-    def _transform_to_lidar_frame(self, traj_ego: np.ndarray) -> np.ndarray:
+    def _transform_to_lidar_frame(self, traj_ego: np.ndarray, z_height: float = 0.0) -> np.ndarray:
         """
         将 ego frame 的轨迹转换到 lidar frame
 
         使用 ego2lidar 转换矩阵（将 ego 坐标转换到 lidar）
 
         Args:
-            traj_ego: (N, 3) ego frame 中的轨迹点 [x, y, z,]
+            traj_ego: (N, 3) ego frame 中的轨迹点 [x, y, heading]（注意：第三列是 heading 不是 z）
+            z_height: 轨迹点的 z 坐标高度，默认 0.0（地面）
 
         Returns:
-            traj_lidar: (N, 3) lidar frame 中的轨迹点
+            traj_lidar: (N, 3) lidar frame 中的轨迹点 [x, y, z]
         """
         N = traj_ego.shape[0]
-        traj_lidar = np.zeros_like(traj_ego)
+        traj_lidar = np.zeros((N, 3), dtype=np.float32)
 
-        # 转换位置 (x, y, z)
+        # 转换位置 (x, y, z=0)
         for i in range(N):
-            # 构建齐次坐标
-            ego_pos = np.array([traj_ego[i, 0], traj_ego[i, 1],
-                               traj_ego[i, 2] if traj_ego.shape[1] > 2 else 0.0, 1.0])
+            # 构建齐次坐标（z 设为 z_height，通常是地面高度 0）
+            ego_pos = np.array([traj_ego[i, 0], traj_ego[i, 1], z_height, 1.0])
 
             # 应用 ego2lidar 转换
             lidar_pos = self.config.ego2lidar @ ego_pos
 
             traj_lidar[i, 0] = lidar_pos[0]
             traj_lidar[i, 1] = lidar_pos[1]
-            if traj_ego.shape[1] > 2:
-                traj_lidar[i, 2] = lidar_pos[2]
+            traj_lidar[i, 2] = lidar_pos[2]
 
         return traj_lidar
+
+    def _euler_to_rotation_matrix(self, roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+        """
+        欧拉角（ZYX顺序）转换为旋转矩阵
+
+        Args:
+            roll_deg: roll 角度（绕 X 轴旋转）
+            pitch_deg: pitch 角度（绕 Y 轴旋转）
+            yaw_deg: yaw 角度（绕 Z 轴旋转）
+
+        Returns:
+            R: (3, 3) 旋转矩阵
+        """
+        roll = math.radians(roll_deg)
+        pitch = math.radians(pitch_deg)
+        yaw = math.radians(yaw_deg)
+
+        # Rz (yaw)
+        Rz = np.array([
+            [math.cos(yaw), -math.sin(yaw), 0],
+            [math.sin(yaw),  math.cos(yaw), 0],
+            [0,              0,              1]
+        ])
+
+        # Ry (pitch)
+        Ry = np.array([
+            [math.cos(pitch),  0, -math.sin(pitch)],
+            [0,                1, 0              ],
+            [math.sin(pitch),  0,  math.cos(pitch)]
+        ])
+
+        # Rx (roll)
+        Rx = np.array([
+            [1, 0,               0              ],
+            [0, math.cos(roll), -math.sin(roll)],
+            [0, math.sin(roll),  math.cos(roll)]
+        ])
+
+        # ZYX 顺序: R = Rz @ Ry @ Rx
+        return Rz @ Ry @ Rx
+
+    def _build_rslidar2camera_matrix(self) -> np.ndarray:
+        """
+        构建 rslidar → camera 外参转换矩阵
+
+        外参描述的是 camera 在 lidar 坐标系中的位置/姿态，投影需要取逆
+        同时应用坐标轴转换：LiDAR(X前Y左Z上) → Camera(Z前X右Y下)
+
+        Returns:
+            RT: (4, 4) 齐次变换矩阵 (lidar → camera)
+        """
+        # 坐标系轴转换矩阵
+        R_axis = self.config.lidar_to_camera_axis_transform
+
+        # 安装偏差旋转矩阵
+        euler_deg = self.config.camera_to_rslidar_euler_deg
+        R_install = self._euler_to_rotation_matrix(euler_deg[0], euler_deg[1], euler_deg[2])
+
+        # 平移向量（相机在 lidar 坐标系中的位置）
+        t_install = self.config.camera_to_rslidar_translation
+
+        # 构建 camera → lidar 矩阵，取逆得到 lidar → camera
+        T_cam_to_lidar = np.eye(4)
+        T_cam_to_lidar[:3, :3] = R_install
+        T_cam_to_lidar[:3, 3] = t_install
+        T_lidar_to_cam = np.linalg.inv(T_cam_to_lidar)
+
+        # 组合轴转换
+        T_axis = np.eye(4)
+        T_axis[:3, :3] = R_axis
+        RT = T_axis @ T_lidar_to_cam
+
+        return RT
+
+    def _project_points_to_camera(self, points_lidar: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        将 rslidar frame 的 3D 点投影到相机图像平面
+
+        Args:
+            points_lidar: (N, 3) rslidar frame 中的点 [x, y, z]
+
+        Returns:
+            points_2d: (N, 2) 投影后的像素坐标 [u, v]
+            valid_mask: (N,) 有效点掩码（在图像范围内的点）
+        """
+        N = points_lidar.shape[0]
+        if N == 0:
+            return np.zeros((0, 2)), np.zeros(0, dtype=bool)
+
+        # 构建 RT 矩阵
+        RT = self._build_rslidar2camera_matrix()
+
+        # 转换到齐次坐标
+        points_homo = np.hstack([points_lidar, np.ones((N, 1))])  # (N, 4)
+
+        # 转换到相机坐标系
+        points_camera = (RT @ points_homo.T).T[:, :3]  # (N, 3)
+
+        # 使用 OpenCV 进行投影（含畸变校正）
+        K = self.config.single_camera_intrinsic
+        D = self.config.single_camera_distortion
+
+        # cv2.projectPoints 需要 (N, 1, 3) 格式
+        points_camera_cv = points_camera.reshape(-1, 1, 3).astype(np.float64)
+
+        points_2d, _ = cv2.projectPoints(
+            points_camera_cv,
+            np.zeros(3, dtype=np.float64),  # 无额外旋转
+            np.zeros(3, dtype=np.float64),  # 无额外平移
+            K.astype(np.float64),
+            D.astype(np.float64)
+        )
+
+        points_2d = points_2d.reshape(-1, 2)  # (N, 2)
+
+        # 过滤超出图像范围的点
+        u_valid = (points_2d[:, 0] >= 0) & (points_2d[:, 0] < self.config.image_width)
+        v_valid = (points_2d[:, 1] >= 0) & (points_2d[:, 1] < self.config.image_height)
+        valid_mask = u_valid & v_valid
+
+        return points_2d, valid_mask
+
+    def _draw_trajectory_on_image(self, image: np.ndarray, points_2d: np.ndarray,
+                                   valid_mask: np.ndarray, color: Tuple[int, int, int] = (0, 255, 0),
+                                   line_thickness: int = 2, point_radius: int = 5) -> np.ndarray:
+        """
+        在图像上绘制轨迹（线 + 点标记）+ 自车参考点
+
+        Args:
+            image: (H, W, 3) numpy 图像（RGB）
+            points_2d: (N, 2) 投影后的像素坐标 [u, v]
+            valid_mask: (N,) 有效点掩码
+            color: RGB 颜色，默认绿色
+            line_thickness: 线宽，默认 2
+            point_radius: 点半径，默认 5
+
+        Returns:
+            annotated_image: 标注后的图像
+        """
+        annotated = image.copy()
+        H, W = image.shape[:2]
+
+        # 自车参考点（图像底部中心偏左，底部偏上一点避免超出边界）
+        ego_point = (W // 2 - 50, H - 5)
+        ego_radius = 10
+
+        # 获取有效轨迹点
+        valid_points = points_2d[valid_mask]
+        if len(valid_points) < 1:
+            # 仅绘制自车点
+            cv2.circle(annotated, ego_point, ego_radius, color, -1)
+            return annotated
+
+        valid_points_int = valid_points.astype(np.int32)
+
+        # 找到距离自车参考点最近的轨迹点
+        distances = np.sqrt((valid_points_int[:, 0] - ego_point[0])**2 +
+                           (valid_points_int[:, 1] - ego_point[1])**2)
+        nearest_idx = np.argmin(distances)
+        nearest_point = tuple(valid_points_int[nearest_idx])
+
+        # 绘制自车点到最近轨迹点的连线（统一颜色和线宽）
+        cv2.line(annotated, ego_point, nearest_point, color, line_thickness)
+
+        # 绘制轨迹线（连接相邻点）
+        for i in range(len(valid_points_int) - 1):
+            pt1 = tuple(valid_points_int[i])
+            pt2 = tuple(valid_points_int[i + 1])
+            cv2.line(annotated, pt1, pt2, color, line_thickness)
+
+        # 绘制自车点（较大）
+        cv2.circle(annotated, ego_point, ego_radius, color, -1)
+
+        # 绘制轨迹点标记
+        for pt in valid_points_int:
+            cv2.circle(annotated, tuple(pt), point_radius, color, -1)
+
+        return annotated
+
+    def _publish_fpv_trajectory_view(self, image_single_np: np.ndarray, traj_ego: np.ndarray):
+        """
+        发布第一视角轨迹可视化图像
+
+        Args:
+            image_single_np: (1080, 1920, 3) 单相机原始图像
+            traj_ego: (N, 3) 预测轨迹 (ego frame) [x, y, heading]
+        """
+        try:
+            # 1. 将预测轨迹从 ego frame 转换到 rslidar frame
+            traj_lidar = self._transform_to_lidar_frame(traj_ego)
+
+            # 2. 投影到相机图像平面（使用内参和外参）
+            points_2d, valid_mask = self._project_points_to_camera(traj_lidar)
+
+            # 3. 裁剪图像：顶部截 200，底部截 100
+            crop_top = 200
+            crop_bottom = 100
+            cropped_image = image_single_np[crop_top:-crop_bottom, :]  # (780, 1920, 3)
+
+            # 4. 调整投影点 y 坐标（减去裁剪起始行）
+            points_2d_adjusted = points_2d.copy()
+            points_2d_adjusted[:, 1] -= crop_top
+
+            # 5. 更新有效掩码（检查裁剪后的图像范围）
+            cropped_height = image_single_np.shape[0] - crop_top - crop_bottom
+            valid_mask_final = (points_2d_adjusted[:, 0] >= 0) & (points_2d_adjusted[:, 0] < self.config.image_width)
+            valid_mask_final &= (points_2d_adjusted[:, 1] >= 0) & (points_2d_adjusted[:, 1] < cropped_height)
+
+            # 6. 在裁剪后的图像上绘制轨迹
+            annotated_image = self._draw_trajectory_on_image(
+                cropped_image, points_2d_adjusted, valid_mask_final,
+                color=(0, 255, 0),      # 绿色
+                line_thickness=10,      # 加粗线宽
+                point_radius=12         # 加粗点大小
+            )
+
+            # 7. 发布
+            ros_image = self._numpy_to_ros_image(annotated_image, encoding='rgb8', frame_id='camera')
+            self.fpv_trajectory_pub.publish(ros_image)
+
+        except Exception as e:
+            rospy.logwarn(f"第一视角轨迹可视化发布失败：{e}")
 
     def _yaw_to_quaternion(self, yaw: float) -> Quaternion:
         q = Quaternion()
@@ -811,17 +1145,17 @@ class DiffusionDriveROSNode:
         q.w = math.cos(yaw / 2.0)
         return q
 
-    def _publish_stitched_image(self, stitched_image: np.ndarray):
-        """发布拼接后的图像"""
+    def _publish_input_image(self, input_image: np.ndarray):
+        """发布输入图像（拼接/裁剪后）"""
         try:
-            ros_image = self._numpy_to_ros_image(stitched_image, encoding='rgb8', frame_id='camera_front')
-            self.stitched_image_pub.publish(ros_image)
+            ros_image = self._numpy_to_ros_image(input_image, encoding='rgb8', frame_id='camera_front')
+            self.input_image_pub.publish(ros_image)
         except Exception as e:
-            rospy.logwarn(f"发布拼接图像失败：{e}")
+            rospy.logwarn(f"发布输入图像失败：{e}")
 
-    def _publish_history_path(self, local_history: np.ndarray):
+    def _publish_history_marker(self, local_history: np.ndarray):
         """
-        发布本地历史轨迹为 Path 消息（在 rslidar frame 中）
+        发布本地历史轨迹为蓝色 LINE_STRIP Marker（在 rslidar frame 中）
 
         Args:
             local_history: (N, 3) numpy array, 每行为 [x, y, yaw] 在 ego frame 中
@@ -838,30 +1172,41 @@ class DiffusionDriveROSNode:
         # 将本地历史轨迹从 ego frame 转换到 lidar frame
         local_history = self._transform_to_lidar_frame(local_history)
 
-        path = Path()
-        path.header.stamp = stamp
-        path.header.frame_id = frame_id
+        # 构建 Marker 消息
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = frame_id
+        marker.ns = "history_trajectory"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
 
+        # 蓝色：r=0, g=0, b=1, a=1
+        marker.color.r = 0.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+
+        # 线宽 0.1m
+        marker.scale.x = 0.15
+
+        # 添加轨迹点
         for pt in local_history:
-            pose_stamped = PoseStamped()
-            pose_stamped.header = path.header
-            pose_stamped.pose.position.x = float(pt[0])
-            pose_stamped.pose.position.y = float(pt[1])
-            pose_stamped.pose.position.z = float(pt[2]) if len(pt) > 2 else 0.0
-            heading = float(pt[3]) if len(pt) > 3 else 0.0
-            pose_stamped.pose.orientation = self._yaw_to_quaternion(heading)
-            path.poses.append(pose_stamped)
+            point = Point()
+            point.x = float(pt[0])
+            point.y = float(pt[1])
+            point.z = float(pt[2]) if len(pt) > 2 else 0.0
+            marker.points.append(point)
 
-        self.history_trajectory_pub.publish(path)
+        self.history_marker_pub.publish(marker)
 
 
-    def _publish_trajectory(self, traj_ego: np.ndarray):
+    def _publish_prediction_marker(self, traj_ego: np.ndarray):
         """
-        发布 LiDAR frame 中的轨迹，包括路径和轨迹点
+        发布预测轨迹为绿色 LINE_STRIP Marker（在 rslidar frame 中）
 
-        发布两个消息：
-        1. Path - 用于可视化连接的路径线
-        2. PoseArray - 用于可视化离散的轨迹点
+        Args:
+            traj_ego: (N, 3) numpy array, 每行为 [x, y, yaw] 在 ego frame 中
         """
         if self.config.verbose_info:
             rospy.loginfo_throttle(
@@ -875,45 +1220,55 @@ class DiffusionDriveROSNode:
         # 转换到 lidar frame
         traj_ego = self._transform_to_lidar_frame(traj_ego)
 
-        # 构建 Path 消息（连接的路径线）
-        path = Path()
-        path.header.stamp = stamp
-        path.header.frame_id = frame_id
+        # 构建 Marker 消息
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = frame_id
+        marker.ns = "prediction_trajectory"
+        marker.id = 1
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
 
-        # 构建 PoseArray 消息（轨迹点）
-        pose_array = PoseArray()
-        pose_array.header.stamp = stamp
-        pose_array.header.frame_id = frame_id
+        # 绿色：r=0, g=1, b=0, a=1
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
 
+        # 线宽 0.15m（稍粗以区分）
+        marker.scale.x = 0.15
+
+        # 添加轨迹点
         for pt in traj_ego:
-            # 创建 PoseStamped 用于 Path
-            pose_stamped = PoseStamped()
-            pose_stamped.header = path.header
-            pose_stamped.pose.position.x = float(pt[0])
-            pose_stamped.pose.position.y = float(pt[1])
-            pose_stamped.pose.position.z = float(pt[2]) if len(pt) > 2 else 0.0
-            heading = float(pt[3]) if len(pt) > 3 else 0.0
-            pose_stamped.pose.orientation = self._yaw_to_quaternion(heading)
-            path.poses.append(pose_stamped)
+            point = Point()
+            point.x = float(pt[0])
+            point.y = float(pt[1])
+            point.z = float(pt[2]) if len(pt) > 2 else 0.0
+            marker.points.append(point)
 
-            # 创建 Pose 用于 PoseArray
-            pose = pose_stamped.pose
-            pose_array.poses.append(pose)
-
-        # 同时发布 Path 和 PoseArray
-        self.trajectory_pub.publish(path)
-        self.trajectory_points_pub.publish(pose_array)
+        self.prediction_marker_pub.publish(marker)
         
 
     def _infer(self, command_one_hot: np.ndarray) -> np.ndarray:
         t0 = time.perf_counter()
 
-        image_left_np = self._decode_image(self.buffer.latest_image_left)
-        image_right_np = self._decode_image(self.buffer.latest_image_right)
         raw_lidar = self._parse_pointcloud2(self.buffer.latest_pointcloud)
+
+        # 始终解码单相机图像（用于第一视角轨迹可视化）
+        image_single_np = self._decode_image(self.buffer.latest_image_single)
+
+        # 模型输入根据 image_input_mode 决定
+        if self.config.image_input_mode == "dual_camera":
+            print("[INFO] Camera input mode: dual_camera")
+            image_left_np = self._decode_image(self.buffer.latest_image_left)
+            image_right_np = self._decode_image(self.buffer.latest_image_right)
+            camera_feature, vis_image = self._build_camera_feature(image_left_np, image_right_np)
+        else:
+            print("[INFO] Camera input mode: single_camera")
+            camera_feature, vis_image = self._build_camera_feature_single(image_single_np)
+
         t1 = time.perf_counter()
 
-        camera_feature, stitched_image = self._build_camera_feature(image_left_np, image_right_np)
         lidar_feature = self._build_lidar_feature(raw_lidar)
         status_feature = self.buffer.get_status_feature(command_one_hot)
 
@@ -937,8 +1292,11 @@ class DiffusionDriveROSNode:
 
         pred_traj_np = pred_traj.squeeze(0).cpu().numpy()
 
-        # 发布拼接图像
-        self._publish_stitched_image(stitched_image)
+        # 发布输入图像（可视化）
+        self._publish_input_image(vis_image)
+
+        # 第一视角轨迹可视化（始终使用单相机图像）
+        self._publish_fpv_trajectory_view(image_single_np, pred_traj_np)
 
         self.last_infer_ms = (t3 - t0) * 1000.0
         self.inference_count += 1
@@ -955,11 +1313,11 @@ class DiffusionDriveROSNode:
         while not rospy.is_shutdown():
             try:
                 if self.buffer.is_ready():
-                    command_one_hot = self.command_to_onehot(carla_command=3, expand=False)
+                    command_one_hot = self.command_to_onehot(carla_command=self.current_command, expand=False)
                     traj_ego = self._infer(command_one_hot)
                     local_history = self.buffer.get_local_history_trajectory()
-                    self._publish_history_path(local_history)
-                    self._publish_trajectory(traj_ego)
+                    self._publish_history_marker(local_history)
+                    self._publish_prediction_marker(traj_ego)
                     # self.memory_monitor.check_threshold(threshold_percent=85)
                 else:
                     rospy.loginfo_throttle(
