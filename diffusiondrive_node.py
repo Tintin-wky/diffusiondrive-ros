@@ -53,7 +53,7 @@ from sensor_msgs.msg import Image, PointCloud2, CameraInfo, PointField, Imu, Com
 from geometry_msgs.msg import PoseStamped, PoseArray, Quaternion, Twist, Point
 from novatel_oem7_msgs.msg import INSPVAX  # NovAtel 惯导消息
 from visualization_msgs.msg import Marker
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, Float32MultiArray
 
 # TransFuser/DiffusionDrive 导入
 from model.transfuser_agent import TransfuserAgent
@@ -98,6 +98,7 @@ class DiffusionDriveROSConfig:
         self.history_marker_topic = "/diffusiondrive/history_marker"
         self.prediction_marker_topic = "/diffusiondrive/prediction_marker"
         self.command_topic = "/diffusiondrive/command"  # 导航命令输入
+        self.waypoint_topic = "/diffusiondrive/waypoint"  # waypoint 输出话题
 
         # ========== 推理配置 ==========
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -574,6 +575,11 @@ class DiffusionDriveROSNode:
         # 第一视角轨迹可视化发布器
         self.fpv_trajectory_pub = rospy.Publisher(
             self.config.fpv_trajectory_view_topic, Image, queue_size=10
+        )
+
+        # waypoint 发布器
+        self.waypoint_pub = rospy.Publisher(
+            self.config.waypoint_topic, Float32MultiArray, queue_size=1
         )
 
         # 订阅器
@@ -1247,6 +1253,27 @@ class DiffusionDriveROSNode:
             marker.points.append(point)
 
         self.prediction_marker_pub.publish(marker)
+
+    def _publish_waypoint(self, traj_ego: np.ndarray):
+        """
+        从轨迹第1步提取 waypoint 并发布
+
+        Args:
+            traj_ego: (N, 3) numpy array, 每行 [x, y, heading]
+        """
+        if len(traj_ego) < 1:
+            return
+
+        # 取第1步: (x, y, heading)
+        x, y, heading = traj_ego[0]
+
+        # 构建 4D waypoint: [dx, dy, hx, hy]
+        hx = np.cos(heading)
+        hy = np.sin(heading)
+
+        msg = Float32MultiArray()
+        msg.data = [float(x), float(y), float(hx), float(hy)]
+        self.waypoint_pub.publish(msg)
         
 
     def _infer(self, command_one_hot: np.ndarray) -> np.ndarray:
@@ -1318,6 +1345,7 @@ class DiffusionDriveROSNode:
                     local_history = self.buffer.get_local_history_trajectory()
                     self._publish_history_marker(local_history)
                     self._publish_prediction_marker(traj_ego)
+                    self._publish_waypoint(traj_ego)
                     # self.memory_monitor.check_threshold(threshold_percent=85)
                 else:
                     rospy.loginfo_throttle(
