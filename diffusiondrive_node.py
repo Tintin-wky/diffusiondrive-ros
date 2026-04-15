@@ -1267,12 +1267,9 @@ class DiffusionDriveROSNode:
         # 取第1步: (x, y, heading)
         x, y, heading = traj_ego[3]  # 注意：索引 3 是第4步，索引 0 是当前点
 
-        # 构建 4D waypoint: [dx, dy, hx, hy]
-        hx = np.cos(heading)
-        hy = np.sin(heading)
-
+        # 构建 3D waypoint: [x, y, heading]
         msg = Float32MultiArray()
-        msg.data = [float(x), float(y), float(hx), float(hy)]
+        msg.data = [float(x), float(y), float(heading)]
         self.waypoint_pub.publish(msg)
         
 
